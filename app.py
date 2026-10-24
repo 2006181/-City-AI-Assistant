@@ -1,13 +1,18 @@
-
+import json
 import os
+import uuid
+
 import requests
 import streamlit as st
 from dotenv import load_dotenv
 
 from langchain.agents import create_agent
+from langchain.agents.middleware import HumanInTheLoopMiddleware
 from langchain.tools import tool
 from langchain_tavily import TavilySearch
 from langchain_google_genai import ChatGoogleGenerativeAI
+from langgraph.checkpoint.memory import InMemorySaver
+from langgraph.types import Command
 
 load_dotenv()
 
@@ -100,7 +105,6 @@ def get_news(city: str) -> str:
         })
 
         if isinstance(response, str):
-            import json
             try:
                 response = json.loads(response)
             except ValueError:
@@ -131,7 +135,7 @@ def get_news(city: str) -> str:
 
 
 # -------------------------
-# Clean AI response
+# Response and interrupt helpers
 # -------------------------
 
 def extract_text(content):
@@ -149,7 +153,6 @@ def extract_text(content):
                     text = block.get("text", "")
                     if isinstance(text, str) and text.strip():
                         parts.append(text.strip())
-
             elif isinstance(block, str) and block.strip():
                 parts.append(block.strip())
 
@@ -158,8 +161,14 @@ def extract_text(content):
     return ""
 
 
+def result_value(result):
+    """Support both the normal dict result and LangChain GraphOutput."""
+    return getattr(result, "value", result)
+
+
 def get_final_answer(result):
-    messages = result.get("messages", [])
+    state = result_value(result)
+    messages = state.get("messages", []) if isinstance(state, dict) else []
 
     for message in reversed(messages):
         if getattr(message, "type", None) == "ai":
@@ -169,6 +178,101 @@ def get_final_answer(result):
                     return answer
 
     return "I couldn't generate a response. Please try again."
+
+
+def get_interrupts(result):
+    """Return pending LangGraph interrupts across supported result shapes."""
+    interrupts = getattr(result, "interrupts", None)
+    if interrupts is not None:
+        return list(interrupts)
+
+    state = result_value(result)
+    if isinstance(state, dict):
+        return list(state.get("__interrupt__", []))
+
+    return []
+
+
+def build_agent(tool_mode):
+    """Build/cache one create_agent instance for the selected sidebar mode."""
+    enabled_tools = []
+
+    if tool_mode in ("Weather assistant", "All tools"):
+        enabled_tools.append(get_weather)
+
+    if tool_mode in ("News assistant", "All tools"):
+        enabled_tools.append(get_news)
+
+    middleware = []
+    if enabled_tools:
+        middleware.append(
+            HumanInTheLoopMiddleware(
+                interrupt_on={
+                    selected_tool.name: {
+                        "allowed_decisions": ["approve", "reject"]
+                    }
+                    for selected_tool in enabled_tools
+                },
+                description_prefix="The assistant wants to run this tool",
+            )
+        )
+
+    llm = ChatGoogleGenerativeAI(
+        model=GEMINI_MODEL,
+        google_api_key=GEMINI_API_KEY,
+        timeout=60,
+        max_retries=2
+    )
+
+    return create_agent(
+        model=llm,
+        tools=enabled_tools,
+        middleware=middleware,
+        checkpointer=st.session_state.checkpointer,
+        system_prompt=(
+            "You are a helpful City AI Assistant. "
+            "Give clear, accurate, concise answers. "
+            "Use available tools when relevant. "
+            "Never invent weather readings or news articles. "
+            "If a required tool is unavailable, tell the user. "
+            "Do not include signatures, hidden metadata, or unnecessary sign-offs. "
+            "For news, include the article links returned by the tool."
+        )
+    )
+
+
+def save_agent_result(result, thread_id, tool_mode):
+    """Save a pause for review, or append the completed assistant response."""
+    interrupts = get_interrupts(result)
+
+    if interrupts:
+        st.session_state.pending_approval = {
+            "thread_id": thread_id,
+            "tool_mode": tool_mode,
+            "interrupts": interrupts,
+        }
+        return
+
+    answer = get_final_answer(result)
+    st.session_state.messages.append({"role": "assistant", "content": answer})
+    st.session_state.pending_approval = None
+
+
+# -------------------------
+# Session state
+# -------------------------
+
+if "messages" not in st.session_state:
+    st.session_state.messages = []
+
+if "checkpointer" not in st.session_state:
+    st.session_state.checkpointer = InMemorySaver()
+
+if "agents" not in st.session_state:
+    st.session_state.agents = {}
+
+if "pending_approval" not in st.session_state:
+    st.session_state.pending_approval = None
 
 
 # -------------------------
@@ -186,13 +290,17 @@ with st.sidebar:
             "News assistant",
             "All tools"
         ],
-        index=3
+        index=3,
+        disabled=st.session_state.pending_approval is not None,
     )
 
     st.caption("Weather and news tools run only when enabled in the selected mode.")
 
     if st.button("Clear chat", use_container_width=True):
         st.session_state.messages = []
+        st.session_state.pending_approval = None
+        st.session_state.agents = {}
+        st.session_state.checkpointer = InMemorySaver()
         st.rerun()
 
     st.divider()
@@ -204,9 +312,7 @@ with st.sidebar:
 # -------------------------
 
 if not GEMINI_API_KEY:
-    st.error(
-        "Google Gemini API key is missing. Add GOOGLE_API_KEY to your .env file."
-    )
+    st.error("Google Gemini API key is missing. Add GOOGLE_API_KEY to your .env file.")
     st.stop()
 
 
@@ -214,79 +320,131 @@ if not GEMINI_API_KEY:
 # Chat history
 # -------------------------
 
-if "messages" not in st.session_state:
-    st.session_state.messages = []
-
 for message in st.session_state.messages:
     with st.chat_message(message["role"]):
         st.markdown(message["content"])
 
 
 # -------------------------
+# Human approval panel
+# -------------------------
+
+pending = st.session_state.pending_approval
+
+if pending:
+    with st.chat_message("assistant"):
+        st.warning("The assistant is waiting for your decision before running a tool.")
+
+        action_requests = []
+        for interrupt in pending["interrupts"]:
+            value = getattr(interrupt, "value", {})
+            if not isinstance(value, dict):
+                continue
+
+            if isinstance(value.get("action_requests"), list):
+                action_requests.extend(value["action_requests"])
+            elif value.get("name"):
+                # Also handle the per-call interrupt shape from newer LangChain versions.
+                action_requests.append(value)
+
+        for index, action in enumerate(action_requests, start=1):
+            st.markdown(f"**Tool request {index}: `{action.get('name', 'unknown')}`**")
+            st.caption(action.get("description", "Review the arguments before deciding."))
+            st.json(action.get("args", {}))
+
+        if not action_requests:
+            st.error("Could not read the pending tool request. Clear the chat and try again.")
+        else:
+            approve_col, reject_col = st.columns(2)
+            approve_clicked = approve_col.button(
+                "Approve all calls",
+                type="primary",
+                use_container_width=True,
+                key="approve_pending_tools",
+            )
+            reject_clicked = reject_col.button(
+                "Reject all calls",
+                use_container_width=True,
+                key="reject_pending_tools",
+            )
+
+            if approve_clicked or reject_clicked:
+                decision_type = "approve" if approve_clicked else "reject"
+                decisions = [
+                    {"type": decision_type}
+                    if decision_type == "approve"
+                    else {
+                        "type": "reject",
+                        "message": "The user rejected this tool call.",
+                    }
+                    for _ in action_requests
+                ]
+
+                agent = st.session_state.agents[pending["tool_mode"]]
+                config = {
+                    "configurable": {"thread_id": pending["thread_id"]}
+                }
+
+                try:
+                    with st.spinner("Continuing the assistant..."):
+                        # The agent resumes from its saved interrupt. Rejected calls
+                        # receive a rejection ToolMessage and are never executed.
+                        result = agent.invoke(
+                            Command(resume={"decisions": decisions}),
+                            config=config,
+                        )
+                        save_agent_result(
+                            result,
+                            pending["thread_id"],
+                            pending["tool_mode"],
+                        )
+                    st.rerun()
+                except Exception as error:
+                    st.error("The assistant could not continue after that decision.")
+                    with st.expander("Technical details"):
+                        st.code(str(error))
+
+
+# -------------------------
 # Chat input and agent
 # -------------------------
 
-user_input = st.chat_input("Ask about a city, weather, news, or anything else...")
+user_input = st.chat_input(
+    "Ask about a city, weather, news, or anything else...",
+    disabled=st.session_state.pending_approval is not None,
+)
 
 if user_input:
-    st.session_state.messages.append({
-        "role": "user",
-        "content": user_input
-    })
+    st.session_state.messages.append({"role": "user", "content": user_input})
 
     with st.chat_message("user"):
         st.markdown(user_input)
 
-    tools = []
-
-    if tool_mode in ("Weather assistant", "All tools"):
-        tools.append(get_weather)
-
-    if tool_mode in ("News assistant", "All tools"):
-        tools.append(get_news)
-
     try:
+        if tool_mode not in st.session_state.agents:
+            st.session_state.agents[tool_mode] = build_agent(tool_mode)
+
+        agent = st.session_state.agents[tool_mode]
+        thread_id = str(uuid.uuid4())
+        config = {"configurable": {"thread_id": thread_id}}
+
+        # Each turn gets a fresh checkpoint thread and receives the visible chat
+        # history. This keeps mode changes from mixing incompatible tool graphs.
+        conversation = [
+            {"role": item["role"], "content": item["content"]}
+            for item in st.session_state.messages
+        ]
+
         with st.chat_message("assistant"):
             with st.spinner("Thinking..."):
-                llm = ChatGoogleGenerativeAI(
-                    model=GEMINI_MODEL,
-                    google_api_key=GEMINI_API_KEY,
-                    timeout=60,
-                    max_retries=2
-                )
+                result = agent.invoke({"messages": conversation}, config=config)
 
-                agent = create_agent(
-                    model=llm,
-                    tools=tools,
-                    system_prompt=(
-                        "You are a helpful City AI Assistant. "
-                        "Give clear, accurate, concise answers. "
-                        "Use available tools when relevant. "
-                        "Never invent weather readings or news articles. "
-                        "If a required tool is unavailable, tell the user. "
-                        "Do not include signatures, hidden metadata, "
-                        "or unnecessary sign-offs. "
-                        "For news, include the article links returned by the tool."
-                    )
-                )
+            save_agent_result(result, thread_id, tool_mode)
 
-                result = agent.invoke({
-                    "messages": [
-                        {
-                            "role": "user",
-                            "content": user_input
-                        }
-                    ]
-                })
-
-                answer = get_final_answer(result)
-
-            st.markdown(answer)
-
-        st.session_state.messages.append({
-            "role": "assistant",
-            "content": answer
-        })
+            if st.session_state.pending_approval:
+                st.info("Review the tool request below to continue.")
+            else:
+                st.markdown(st.session_state.messages[-1]["content"])
 
     except Exception as error:
         error_message = (
@@ -303,3 +461,4 @@ if user_input:
             "role": "assistant",
             "content": error_message
         })
+
