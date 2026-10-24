@@ -442,7 +442,9 @@ if user_input:
             save_agent_result(result, thread_id, tool_mode)
 
             if st.session_state.pending_approval:
-                st.info("Review the tool request below to continue.")
+                # This panel appears earlier in the script, so rerun to render
+                # the newly saved interrupt and its approval controls.
+                st.rerun()
             else:
                 st.markdown(st.session_state.messages[-1]["content"])
 
@@ -459,6 +461,4 @@ if user_input:
 
         st.session_state.messages.append({
             "role": "assistant",
-            "content": error_message
-        })
 
