@@ -44,11 +44,11 @@ City-AI-Assistant/
 ### 1. Clone the repository
 
 ```bash
-git clone YOUR_GITHUB_REPOSITORY_URL
+git clone https://github.com/2006181/-City-AI-Assistant.git
 cd City-AI-Assistant
 ```
 
-Replace `YOUR_GITHUB_REPOSITORY_URL` with your repository URL.
+Replace `https://github.com/2006181/-City-AI-Assistant.git` with your repository URL.
 
 ### 2. Create a virtual environment
 
@@ -137,9 +137,7 @@ Open the URL in your browser.
 
 ## 🚀 Deployment
 
-The application can be deployed on Streamlit Community Cloud or another compatible hosting platform.
-
-Add the required environment variables in the deployment platform's secrets settings instead of uploading `.env`.
+Streamlit link - https://g7f9znyt4t9umphhhcgaor.streamlit.app/
 
 ## ⚠️ Notes
 
